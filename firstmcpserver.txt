@@ -1,0 +1,46 @@
+import random
+from mcp.server.fastmcp import FastMCP
+
+# Create MCP server instance
+mcp = FastMCP("simple_mcp_server")
+
+# Tool 1: Generate random number
+@mcp.tool()
+def generate_random_number() -> dict:
+    """
+    Generate a random number between 1 and 100.
+    """
+    return {"number": random.randint(1, 100)}
+
+# Tool 2: Reverse text
+@mcp.tool()
+def reverse_text(text: str) -> dict:
+    """
+    Reverse the provided string.
+    Args:
+        text: Input string
+    """
+    return {"reversed": text[::-1]}
+
+# Tool 3: Get dummy weather info
+@mcp.tool()
+def get_weather(city: str) -> dict:
+    """
+    Get fake weather info for a given city.
+    Args:
+        city: Name of the city.
+    """
+    weather_map = {
+        "Dhaka": "Sunny, 32°C",
+        "Chittagong": "Cloudy, 30°C",
+        "Khulna": "Rainy, 28°C"
+    }
+    return {"weather": weather_map.get(city, "Data not available")}
+
+if __name__ == "__main__":
+    # By default it will bind on 127.0.0.1:8000
+    # You can adjust by setting mcp.settings.host / mcp.settings.port
+    # Transport can be "streamable-http" or "sse"
+    
+    #mcp.run(transport="streamable-http")
+    mcp.run(transport="sse")
