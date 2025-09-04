@@ -1,0 +1,654 @@
+from langgraph.graph import StateGraph, END
+from langchain_tcs_bfsi_genai import APIClient, Auth, TCSLLMs
+import json
+import requests
+import datetime # Import for timestamps
+from requests.auth import HTTPBasicAuth
+import os
+import yaml
+import re
+from collections import defaultdict
+from .servicenow import UpdateSNOWTicket
+import oracledb
+
+# client = APIClient()
+# auth = Auth(client)
+
+# auth.login('1334398', 'Aditya@1334398') 
+# llm = TCSLLMs(client=client, model_name="gpt-4o")
+
+SOP_FILE_PATH = "application_SOP.yaml"
+
+def agent_log_extractor_and_resolution_recommender(ticket_number,sys_id,short_desc,description):
+        result = {}
+        html_content = f"""
+            <section>
+            <p style='text-align:left; font-weight:bold;font-size:24px;color: darkblue'> 🔎 Log Analysis & Resolution Recommendations </p>
+            <hr style='border:1px solid gold; margin-top:20px; margin-bottom:20px;' />
+            <p>🔍 Going to connect to Splunk endpoints with credentials...</p>
+        """
+        # Replace with your actual values
+        splunk_base_url = "https://10.169.51.2:8081/api/splunk"
+        username = "admin"
+        password = "ismart123"
+        issue_type = ""
+        search_query = ""
+
+        desc_resp = fetchIssueType(description)
+        final_json = json.loads(desc_resp)
+        issue_type = final_json["issue_type"]
+        print(issue_type)
+        print(issue_type,flush=True)
+        if "ACCESS" in issue_type:
+            print("final check in issue_type")
+            issue_type = "USER_ACCESS"
+        elif "JVM" in issue_type:
+            print("final check in issue_type")
+            issue_type = "JVM_ISSUE"
+        elif "HIGH_CPU_USAGE" in issue_type:
+            print("final check in issue_type")
+            issue_type = "HIGH_CPU_USAGE"
+        with oracledb.connect(user="ISMART", password="ismart123",host="10.169.51.1", port=8889,service_name="XEPDB1") as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT SPLUNK_QUERY FROM zinc_pipeline_splunk_query WHERE ISSUE_TYPE = :issue_type
+                    """,
+                    {"issue_type": issue_type}
+                )
+                rows = cur.fetchall()
+                if not rows:
+                    return jsonify({"ticket_number": ticket_number, "flow": []})
+                # Build structured flow
+                for row in rows:
+                    if row[0]:
+                        prev_search_query = row[0].read() if hasattr(row[0], 'read') else str(row[0])
+                        empid = extract_incident_details(description)
+                        print(empid)
+                        search_query = prev_search_query.replace("<empid>",empid)
+        # search_query = r'''search index="main" sourcetype="ARE_DEMO" "ERROR" "ORA-28000" earliest=@y latest=now | eval raw_cleaned=replace(_raw, "^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} ", "") | eval logline = strftime(_time,"%Y-%m-%d %H:%M:%S") . " " . raw_cleaned | table logline'''
+        # Create the full URL to the export endpoint
+        url = f"{splunk_base_url}/services/search/jobs/export"
+        # Form data
+        payload = {
+            "search": search_query,
+            "output_mode": "json"
+        }
+        # Go one level up from "controllers" to reach "app"
+        APP_FOLDER = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        # Create (or ensure) log folder under app
+        LOG_FOLDER = os.path.join(APP_FOLDER, "inc_logs")
+        os.makedirs(LOG_FOLDER, exist_ok=True)
+        # Full path to log file
+
+        output_file = os.path.join(LOG_FOLDER, f"ARE_application_error_{ticket_number}.log")
+        message = ""
+        html_content += "<p>🔐 Authenticating with server ID and password...</p>"
+        # Make the request
+        # Call Splunk and save output
+        with requests.post(url, data=payload, auth=HTTPBasicAuth(username, password), verify=False, stream=True) as response:
+            if response.status_code == 200:
+                print("im here")
+                html_content += "<p>📁 Fetching logs from Splunk</p>" # Added backticks
+                with open(output_file, "w", encoding="utf-8") as f:
+                    html_content += "<p>📄 Log file found. Reading now...</p>"
+                    for line in response.iter_lines():
+                        if line:
+                            data = json.loads(line.decode("utf-8"))
+                            log = data.get("result", {}).get("logline")
+                            if log:
+                                f.write(log + "\n")
+                print(f"✅ Logs saved to: {output_file}")
+            else:
+                print(f"❌ Failed to fetch logs: {response.status_code} - {response.text}")
+            
+        logs = read_log_file(output_file)
+        if not logs:
+            html_content += "<p> No logs found.</p>"
+            return
+        # Show initial preview (first 10 lines)
+        preview_lines = 10
+        html_content += "<p style='text-align:left; font-weight:bold;font-size:20px;color: aquamarine;'> 🔍 Error Log Preview: </p>"
+        log_preview_html = f"<pre style='background-color:#f5f5f5; padding:10px;'>{'<br>'.join(logs[:preview_lines])}</pre>"
+        # Append it to your HTML content string
+        html_content += log_preview_html
+        sop_data = load_sop(SOP_FILE_PATH)
+        
+        error_summary_dict = extract_error_summary(output_file)
+        print(error_summary_dict)
+        resolution_recommendations_list = [] # To collect recommendations
+
+        if not error_summary_dict:
+            html_content += "<p style='color:green'> ✅ No errors found in the log file. No specific resolution recommended based on logs.</p>" # Changed to st.info
+        else:
+            html_content += "<p style='text-align:left; font-weight:bold;font-size:20px;color: aquamarine;'> 🪵 Extracted Error Summary: </p>"
+            html_content += f"<pre style='background-color:#f5f5f5; padding:10px;'>{format_summary(error_summary_dict)}</pre>"
+
+            html_content += "<p style='text-align:left; font-weight:bold;font-size:20px;color: aquamarine;'> 📘 Checking SOP for each issue... </p>"
+
+            for key, messages in error_summary_dict.items():
+                    
+                sop_entry = sop_data.get(key)
+                if sop_entry:
+                    html_content += f"<p>🔍 Error Type: {key} </p>" # Bold and backticks
+                    html_content += f"<pre style='background-color:#f5f5f5; padding:10px;'>✅ SOP Found: {sop_entry.get('title')}</pre>" # Changed to st.success
+                    html_content += f"<p>🛠️ Resolution Steps: </p>"
+                    html_content += f"<pre style='background-color:#f5f5f5; padding:10px;'> {sop_entry.get('resolution').replace("<EMP_ID>",empid)}</pre>" # Use st.code for resolution steps
+                            
+                    sop_title = sop_entry.get('title')
+                    sop_resolution = sop_entry.get('resolution').replace("<EMP_ID>",empid)
+                    ai_prompt = (
+                        f"""You are a senior SRE and DevOps engineer. The following error occurred in application logs: {key} ({sop_title})\n\n"
+                        SOP Resolution steps were:\n{sop_resolution}\n\n"
+                        As an expert DevOps/DBA, please provide:\n"
+                        Returns HTML snippets ready to embed in a web page. Dont include any markup or '''html or any code blocks.
+                        Rules:
+                            - Return ONLY a single HTML <section>…</section> string. No explanations.
+                            - Use inline CSS only. No external assets, no <script>.
+                            - Keep styles minimal and self-contained.
+                            - Never include <html> or <body> tags."
+                        1. A Root Cause Analysis (RCA)\n"
+                        2. Long-term or strategic resolution steps to prevent recurrence (mention the steps from SOP also)"""
+                    )
+                    service_prompt = (
+                        f"""You are a senior SRE and DevOps engineer. The following error occurred in application logs: {key} ({sop_title})\n\n"
+                        SOP Resolution steps were:\n{sop_resolution}\n\n"
+                        As an expert DevOps/DBA, please provide:\n"
+                        1. A Root Cause Analysis (RCA)\n"
+                        2. Long-term or strategic resolution steps to prevent recurrence (mention the steps from SOP also)"""
+                    )
+                    try:
+                        client = APIClient()
+                        auth = Auth(client)  
+                        llm = TCSLLMs(client=client, model_name="gpt-4o-mini")
+                        auth.login('1334398', 'Aditya@1334398')
+
+                        # Invoke the LLM for field validation
+                        response = llm.invoke(ai_prompt).strip()
+                        print(response)
+
+                        ai_result = response # Assuming .content gives the string
+                        html_content += f"<p style='text-align:left; font-weight:bold;font-size:25px;color: black;'> 🧠 Strategic Recommendation:</p>"
+                        # html_content += f"<p style='text-align:left; font-weight:bold;font-size:24px;color: black;'>{ai_result}</p>"
+                        html_content += ai_result
+                        ser_response = llm.invoke(service_prompt)
+                        message = ser_response
+                        UpdateSNOWTicket(sys_id,message)
+                    except Exception as e:
+                        html_content += f"<p style='color:red'>❌ LLM call failed for {key}: {e}</p>"
+        # print(html_content)
+        clean_html = re.sub(r"[\n\r\\]+", "", html_content).strip()
+        result["output"] = clean_html
+        result["ai_result"] = message
+        return result
+
+
+def get_error_key(error_msg):
+    match = re.search(r'(ARE-\d{5})', error_msg)
+    if match:
+        return match.group(1)
+    if "connection" in error_msg.lower():
+        return "DB-CONNECTION-ERROR"
+    if "login" in error_msg.lower():
+        return "ARE-LOGIN-FAILURE"
+    return error_msg[:50] # Fallback for other errors
+
+def format_summary(error_dict):
+    summary = []
+    for key, messages in error_dict.items():
+        summary.append(f"- **{key}** occurred {len(messages)} time(s). Example: `{messages[0]}`") # Added backticks for code
+    return "\n".join(summary)
+def load_sop(file_path):
+    try:
+        # Adjust base_path if SOP file is not in the same directory as the script
+        # base_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../")) # Original
+        # file_path = os.path.join(base_path, file_path) # Original
+
+        # For this example, assuming file_path is relative to where the script is run
+        if not os.path.exists(file_path):
+            # st.error(f"Error: SOP file not found at {file_path}. Please create it or adjust the path.")
+            return {}
+
+        with open(file_path, "r") as f:
+            return yaml.safe_load(f)
+    except Exception as e:
+        # st.warning(f"⚠️ Could not load SOP file: {e}") # Changed to st.warning
+        return {}
+
+def extract_error_summary(log_path):
+    error_counts = defaultdict(list)
+    error_pattern = re.compile(r'ERROR\s+(.*)', re.IGNORECASE)
+    
+    # For this example, assuming log_path is relative to where the script is run
+    if not os.path.exists(log_path):
+        # st.error(f"Error: Log file not found at {log_path}. Please create it or adjust the path.")
+        return {}
+
+    with open(log_path, 'r') as f:
+        for line in f:
+            match = error_pattern.search(line)
+            if match:
+                error_message = match.group(1).strip()
+                key = get_error_key(error_message)
+                error_counts[key].append(error_message)
+    return error_counts
+
+
+def read_log_file(path):
+   try:
+       with open(path, "r") as f:
+           return f.readlines()
+   except FileNotFoundError:
+       return ["❌ Log file not found."]
+
+
+def extract_incident_details(user_text):
+   """
+   Extract incident details from user text using OpenAI.
+   Works for both structured input and free-form text.
+   """
+   prompt = f"""
+   You are an assistant that extracts structured data.Extract incident details from the text below into JSON with these keys:
+   - Application
+   - Issue
+   - User ID (if it has any specific user ids then return it, if user write multiple but dont mentioned the specific details then it will return NA, so its not mandatory)
+   - Timestamp
+   - Impacted
+   Rules:
+   - If a value is missing, set it to "NA".
+   - Always return valid JSON only, without any markdown or any code block.
+   Text: {user_text}
+   """
+   client = APIClient()
+   auth = Auth(client)  
+   llm = TCSLLMs(client=client, model_name="gpt-4o-mini")
+   auth.login('1334398', 'Aditya@1334398')
+
+   response = llm.invoke(prompt)
+   print(response)
+   try:
+       result = json.loads(response)
+   except Exception:
+       result = {
+           "Application": "NA",
+           "Issue": user_text,
+           "User ID": "NA",
+           "Timestamp": "NA",
+           "Impacted": "NA"
+       }
+   return result["User ID"]
+
+def fetchIssueType(description):
+        desc_prompt = f"""
+        You are a Senior engineer who can descide from Issue Description {description} whether it is an user access related issue or jvm issue or high cpu usage issue..
+        Like Not registered or Unable to access or User Authentication Issue or Invalid email & password, then give issue_type as USER_ACCESS. Java heap space or GC overhead limit as JVM_ISSUE, high cpu usage as HIGH_CPU_USAGE. We need only issue type from your end.
+        Give me in json format without any markdown or code block.
+        Sample will be like json of issue_type : USER_ACCESS
+        """
+        client = APIClient()
+        auth = Auth(client)  
+        llm = TCSLLMs(client=client, model_name="gpt-4o-mini")
+        auth.login('1334398', 'Aditya@1334398')
+
+        desc_resp = llm.invoke(desc_prompt)
+        return desc_resp
+
+def agent_log_extractor(inc_data):
+        result = {}
+        # Replace with your actual values
+        splunk_base_url = "https://10.169.51.2:8081/api/splunk"
+        username = "admin"
+        password = "ismart123"
+        ticket_number = inc_data.get("ticket_number")
+        issue_category = inc_data.get("issue_category")
+        issue_sub_category = inc_data.get("issue_sub_category")
+        application = inc_data.get("config_item")
+        description = inc_data.get("description")
+        search_query = ""
+        print(f"issue_category : {issue_category} and issue_sub_category : {issue_sub_category}",flush=True)
+        with oracledb.connect(user="ISMART", password="ismart123",host="10.169.51.1", port=8889,service_name="XEPDB1") as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT SPLUNK_QUERY FROM zinc_pipeline_splunk_query WHERE ISSUE_TYPE = :issue_type and ISSUE_SUB_TYPE = :issue_sub_type and application = :application
+                    """,
+                    {"issue_type": issue_category,"issue_sub_type" : issue_sub_category, "application" : application}
+                )
+                rows = cur.fetchall()
+                if not rows:
+                    return jsonify({"ticket_number": ticket_number, "flow": []})
+                # Build structured flow
+                for row in rows:
+                    if row[0]:
+                        prev_search_query = row[0].read() if hasattr(row[0], 'read') else str(row[0])
+                        empid = extract_incident_details(description)
+                        print(empid)
+                        if empid != "NA":
+                            search_query = prev_search_query.replace("<empid>",empid)
+                        else:
+                            search_query = prev_search_query.replace("<empid>","")
+                        print(search_query)
+        # Create the full URL to the export endpoint
+        url = f"{splunk_base_url}/services/search/jobs/export"
+        # Form data
+        payload = {
+            "search": search_query,
+            "earliest_time" : "-2h",
+            "latest_time" : "now",
+            "output_mode": "json"
+        }
+        APP_FOLDER = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        LOG_FOLDER = os.path.join(APP_FOLDER, "inc_logs")
+        os.makedirs(LOG_FOLDER, exist_ok=True)
+        output_file = os.path.join(LOG_FOLDER, f"ARE_application_error_{ticket_number}.log")
+        message = ""
+        # Make the request
+        # Call Splunk and save output
+        with requests.post(url, data=payload, auth=HTTPBasicAuth(username, password), verify=False, stream=True) as response:
+            if response.status_code == 200:
+                wrote_any = False
+                logs_collected = []
+                with open(output_file, "w", encoding="utf-8") as f:
+                    
+                    for line in response.iter_lines():
+                        if line:
+                            print(f"line : {line}")
+                            data = json.loads(line.decode("utf-8"))
+                            log = data.get("result", {}).get("logline")
+                            if log:
+                                print("im in log writing")
+                                f.write(log + "\n")
+                                logs_collected.append(log)
+                                wrote_any = True
+                if wrote_any:
+                    result["logFileName"] = f"ARE_application_error_{ticket_number}.log"
+                    result["logs"] = logs_collected[:5]  # keep first 5 as sample
+                    status = "pass"
+                    # 🔹 If subcategory unclassified → call LLM
+                    if issue_sub_category.lower() == "unclassified":
+                        log_snippet = "\n".join(logs_collected[:5]) if logs_collected else "No logs"
+                        llm_prompt = f"""
+                            You are an expert support assistant. 
+                            Classify the incident into the correct **Issue_Sub_Category** 
+                            based on the **Issue_Category**, description, and log snippet.
+                            Here is the data:
+                            - Issue Category: {issue_category}
+                            - Incident Description: {description}
+                            - Log Snippet: {log_snippet}
+                            ### Classification Rules & Examples:
+                            1. User Account Management:
+                            - "locked", "inactive", "disabled" → "Account Locked or Inactive"
+                            - "registration", "not registered", "new user" → "Registration Issue"
+                            2. Authentication Issue:
+                            - "invalid credentials", "wrong password", "incorrect ID" → "Invalid Credentials"
+                            - "expired password", "reset password" → "Password Issue"
+                            3. Application Access:
+                            - "unable to access", "timeout", "denied" → "Access Issue"
+                            - "VPN", "network", "browser" → "Environment/Connectivity Issue"
+                            4. Database Issue:
+                            - "ORA-", "SQL error" → "Database Error"
+                            - "deadlock", "lock wait" → "DB Locking Issue"
+                            If no confident match, return "Unclassified".
+                            ### Response Rules:
+                            - If Issue_Sub_Category is found → "Status" = "pass"
+                            - If not found (Unclassified) → "Status" = "fail"
+                            - Always include a clear "Reason".
+                            - If status = pass, also include the log file path.
+                            ### Response Format (STRICT JSON) without any markdown or any code block:
+                            {{
+                            "Issue_Sub_Category": "...",
+                            "Status": "pass/fail",
+                            "Reason": "...",
+                            "LogPath": "{output_file} if found else ''"
+                            }}
+
+                            """
+                            
+                        client = APIClient()
+                        auth = Auth(client)
+                        auth.login("1334398", "Aditya@1334398")  # replace with creds
+                        llm = TCSLLMs(client=client, model_name="gpt-4o-mini")
+                        try:
+                            llm_response = llm.invoke(llm_prompt)
+                            parsed = json.loads(llm_response)
+                            issue_sub_category = parsed.get("Issue_Sub_Category", "Unclassified")
+                            status = parsed.get("Status", "fail")
+                            print(f"Change it to issue_sub_category : {issue_sub_category}")
+                        except Exception as e:
+                            issue_sub_category = "Unclassified"
+                            result["llm_error"] = str(e)
+                    result["outputText"] = f"✅ Logs saved. Issue_Sub_Category: {issue_sub_category}"
+                    result["Issue_Sub_Category"] = issue_sub_category
+                    result["agent_status"] = status
+                else:
+                    with open(output_file, "w", encoding="utf-8") as f:
+                        f.write("NO_LOGS_FOUND")
+                    result["outputText"] = f"⚠️ No logs found for {ticket_number}"
+                    result["logFileName"] = f"NA"
+                    result["agent_status"] = "fail"
+            else:
+                print(f"❌ Failed to fetch logs: {response.status_code} - {response.text}",flush=True)
+                result["outputText"] = f"❌ Failed to fetch logs: {response.status_code} - {response.text}"
+                result["agent_status"] = "fail"
+        return result
+
+from datetime import datetime, timedelta
+DEFAULT_TIMESTAMP_RES = [
+   r"(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})",     # 2025-09-03 14:00:49
+   r"(?P<ts>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})",     # 2025-09-03T14:00:49
+]
+DEFAULT_TS_FORMATS = [
+   "%Y-%m-%d %H:%M:%S",
+   "%Y-%m-%dT%H:%M:%S",
+]
+def _try_parse_ts(s: str):
+   for fmt in DEFAULT_TS_FORMATS:
+       try:
+           return datetime.strptime(s, fmt)
+       except Exception:
+           pass
+   return None
+def _load_sop(sop_path, app, cat, subcat):
+   with open(sop_path, "r", encoding="utf-8") as f:
+       sop = yaml.safe_load(f)
+   apps = sop.get("applications", {})
+   def pick(*path):
+       d = apps
+       for key in path:
+           if isinstance(d, dict) and key in d:
+               d = d[key]
+           else:
+               return None
+       return d
+   # Fallback order:
+   # (app, cat, subcat) → (app, cat, 'default') → (app, 'default') → ('default')
+   sub = None
+   if subcat and subcat.lower() != "unclassified":
+       sub = pick(app, cat, subcat)
+   if not sub:
+       sub = pick(app, cat, "default")
+   if not sub:
+       sub = pick(app, "default")
+   if not sub:
+       sub = pick("default")
+   # Normalize outputs
+   ts_re = sub.get("timestamp_regex") if isinstance(sub, dict) else None
+   msg_re = sub.get("message_regex") if isinstance(sub, dict) else None
+   # Sensible defaults
+   if not msg_re:
+       msg_re = r"ERROR|Exception|ORA-\d+|NullPointer|CRITICAL|FATAL"
+   ts_res = [ts_re] if ts_re else DEFAULT_TIMESTAMP_RES
+   return ts_res, msg_re
+
+def agent_log_extractor_full(inc_data):
+        result = {}
+        
+        ticket_number = inc_data.get("ticket_number")
+        issue_category = inc_data.get("issue_category")
+        issue_subcat = inc_data.get("issue_sub_category")
+        app = inc_data.get("config_item")
+        description = inc_data.get("description")
+        opened_at_str = inc_data.get("opened_at")
+        sop_path = "issue_categories.yaml"
+        log_file = "logfile.log"
+        out_dir = "app/inc_logs"
+        missing = []
+        if not app:         missing.append("app")
+        if not issue_category:    missing.append("issue_category")
+        if not opened_at_str:
+            missing.append("opened_at")
+        if missing:
+            result["outputText"] = f"❌ Missing required fields: {', '.join(missing)}"
+            result["agent_status"] = "fail"
+            return result
+        # ---- time window (±2h)
+        base_ts = _try_parse_ts(opened_at_str)
+        if not base_ts:
+            return {
+                "agent_name": "AgentLogExtractorForSubCatwise",
+                "agent_status": "fail",
+                "outputText": f"❌ Could not parse opened_at: {opened_at_str}",
+                "logFileName": "NA",
+                "logpath": "NA"
+            }
+        start_ts = base_ts - timedelta(hours=2)
+        end_ts   = base_ts + timedelta(hours=2)
+        # ---- load SOP rules (regexes)
+        ts_patterns, msg_pattern = _load_sop(sop_path, app, issue_category, issue_subcat)
+        ts_regexes = [re.compile(p) for p in ts_patterns]
+        msg_regex  = re.compile(msg_pattern, re.IGNORECASE)
+        # ---- scan the log file
+        matches = []
+        if not os.path.exists(log_file):
+            return {
+                "agent_name": "AgentLogExtractorForSubCatwise",
+                "agent_status": "fail",
+                "outputText": f"❌ Log file not found: {log_file}",
+                "logFileName": "NA",
+                "logpath": "NA"
+            }
+        with open(log_file, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line_stripped = line.rstrip("\n")
+                # 1) find a timestamp using any provided regex
+                ts_found = None
+                for rx in ts_regexes:
+                    m = rx.search(line_stripped)
+                    if m:
+                        ts_text = m.group("ts") if "ts" in m.groupdict() else m.group(0)
+                        ts = _try_parse_ts(ts_text)
+                        if ts:
+                            ts_found = ts
+                            break
+                # 2) time filter: if timestamp found, enforce window; if not found, keep (we rely on message match)
+                if ts_found and not (start_ts <= ts_found <= end_ts):
+                    continue
+                # 3) message filter
+                if msg_regex.search(line_stripped):
+                    matches.append(line_stripped)
+        # ---- write output or fail
+        os.makedirs(out_dir, exist_ok=True)
+        out_name = f"ARE_application_error_{ticket_number}.log"
+        out_path = os.path.join(out_dir, out_name)
+        if matches:
+            with open(out_path, "w", encoding="utf-8") as wf:
+                wf.write("\n".join(matches) + "\n")
+            return {
+                "agent_name": "AgentLogExtractorForSubCatwise",
+                "agent_status": "pass",
+                "outputText": f"✅ Filtered logs saved for {ticket_number}",
+                "logFileName": out_name,
+                "logpath": out_path,
+                "match_count": len(matches),
+                "window": {"start": start_ts.strftime("%Y-%m-%d %H:%M:%S"),
+                            "end": end_ts.strftime("%Y-%m-%d %H:%M:%S")},
+                "applied_message_regex": msg_pattern,
+                "Issue_Sub_Category" : issue_subcat
+            }
+        else:
+            # still create an empty file to keep downstream consistent
+            with open(out_path, "w", encoding="utf-8") as wf:
+                wf.write("")
+            return {
+                "agent_name": "AgentLogExtractorForSubCatwise",
+                "agent_status": "fail",
+                "outputText": f"⚠️ No logs matched window/pattern for {ticket_number}",
+                "logFileName": out_name,
+                "logpath": out_path,
+                "match_count": 0,
+                "window": {"start": start_ts.strftime("%Y-%m-%d %H:%M:%S"),
+                            "end": end_ts.strftime("%Y-%m-%d %H:%M:%S")},
+                "applied_message_regex": msg_pattern,
+                "Issue_Sub_Category" : issue_subcat
+            }
+        #         if wrote_any:
+        #             result["logFileName"] = f"ARE_application_error_{ticket_number}.log"
+        #             result["logs"] = logs_collected[:5]  # keep first 5 as sample
+        #             status = "pass"
+        #             # 🔹 If subcategory unclassified → call LLM
+        #             if issue_sub_category.lower() == "unclassified":
+        #                 log_snippet = "\n".join(logs_collected[:5]) if logs_collected else "No logs"
+        #                 llm_prompt = f"""
+        #                     You are an expert support assistant. 
+        #                     Classify the incident into the correct **Issue_Sub_Category** 
+        #                     based on the **Issue_Category**, description, and log snippet.
+        #                     Here is the data:
+        #                     - Issue Category: {issue_category}
+        #                     - Incident Description: {description}
+        #                     - Log Snippet: {log_snippet}
+        #                     ### Classification Rules & Examples:
+        #                     1. User Account Management:
+        #                     - "locked", "inactive", "disabled" → "Account Locked or Inactive"
+        #                     - "registration", "not registered", "new user" → "Registration Issue"
+        #                     2. Authentication Issue:
+        #                     - "invalid credentials", "wrong password", "incorrect ID" → "Invalid Credentials"
+        #                     - "expired password", "reset password" → "Password Issue"
+        #                     3. Application Access:
+        #                     - "unable to access", "timeout", "denied" → "Access Issue"
+        #                     - "VPN", "network", "browser" → "Environment/Connectivity Issue"
+        #                     4. Database Issue:
+        #                     - "ORA-", "SQL error" → "Database Error"
+        #                     - "deadlock", "lock wait" → "DB Locking Issue"
+        #                     If no confident match, return "Unclassified".
+        #                     ### Response Rules:
+        #                     - If Issue_Sub_Category is found → "Status" = "pass"
+        #                     - If not found (Unclassified) → "Status" = "fail"
+        #                     - Always include a clear "Reason".
+        #                     - If status = pass, also include the log file path.
+        #                     ### Response Format (STRICT JSON) without any markdown or any code block:
+        #                     {{
+        #                     "Issue_Sub_Category": "...",
+        #                     "Status": "pass/fail",
+        #                     "Reason": "...",
+        #                     "LogPath": "{output_file} if found else ''"
+        #                     }}
+
+        #                     """
+                            
+        #                 client = APIClient()
+        #                 auth = Auth(client)
+        #                 auth.login("1334398", "Aditya@1334398")  # replace with creds
+        #                 llm = TCSLLMs(client=client, model_name="gpt-4o-mini")
+        #                 try:
+        #                     llm_response = llm.invoke(llm_prompt)
+        #                     parsed = json.loads(llm_response)
+        #                     issue_sub_category = parsed.get("Issue_Sub_Category", "Unclassified")
+        #                     status = parsed.get("Status", "fail")
+        #                     print(f"Change it to issue_sub_category : {issue_sub_category}")
+        #                 except Exception as e:
+        #                     issue_sub_category = "Unclassified"
+        #                     result["llm_error"] = str(e)
+        #             result["outputText"] = f"✅ Logs saved. Issue_Sub_Category: {issue_sub_category}"
+        #             result["Issue_Sub_Category"] = issue_sub_category
+        #             result["agent_status"] = status
+        #         else:
+        #             with open(output_file, "w", encoding="utf-8") as f:
+        #                 f.write("NO_LOGS_FOUND")
+        #             result["outputText"] = f"⚠️ No logs found for {ticket_number}"
+        #             result["logFileName"] = f"NA"
+        #             result["agent_status"] = "fail"
+        #     else:
+        #         print(f"❌ Failed to fetch logs: {response.status_code} - {response.text}",flush=True)
+        #         result["outputText"] = f"❌ Failed to fetch logs: {response.status_code} - {response.text}"
+        #         result["agent_status"] = "fail"
+        # return result

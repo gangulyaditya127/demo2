@@ -1,0 +1,26 @@
+applications:
+ DHAC:
+   Authentication Issue:
+     Invalid Credentials:
+       timestamp_regex: '^(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})'
+       message_regex: '(Invalid credentials|Incorrect ID or Password)'
+     default:
+       message_regex: 'ERROR|Exception|CRITICAL|FATAL|ORA-\d+'
+   User Account Management:
+     Registration Issue:
+       message_regex: '(Registration failed|Unable to register|Missing mandatory field)'
+     Account Locked or Inactive:
+       timestamp_regex: '^(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})'
+       message_regex: '(locked|inactive)'
+     default:
+       message_regex: 'ERROR|Exception'
+   default:
+     message_regex: 'ERROR|Exception|CRITICAL|FATAL'
+ PayrollApp:
+   Authentication Issue:
+     Invalid Credentials:
+       message_regex: '(Invalid login|Wrong password)'
+   default:
+     message_regex: 'ERROR|Exception|FAIL'
+ default:
+   message_regex: 'ERROR|Exception|CRITICAL|FATAL|ORA-\d+'
