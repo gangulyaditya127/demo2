@@ -1,0 +1,114 @@
+import os
+import streamlit as st
+import chromadb
+from sentence_transformers import SentenceTransformer
+from chromadb.utils import embedding_functions
+
+# ✅ Your existing local ChromaDB client
+client = chromadb.PersistentClient(path="./chromadb")
+
+# ✅ Use your existing embedding function
+from chromadb.utils import embedding_functions
+# Assuming you already defined sentence_transformer_ef somewhere
+# If not, uncomment the below:
+# sentence_transformer_ef = embedding_functions.SentenceTransformerEmbeddingFunction(
+#     model_name="all-MiniLM-L6-v2"
+# )
+sentence_transformer_ef = embedding_functions.SentenceTransformerEmbeddingFunction(
+    model_name="./all-MiniLM-L6-v2"
+)
+# ✅ Get or create the existing "incidents" collection
+collection = client.get_or_create_collection(
+    name="incidents",
+    embedding_function=sentence_transformer_ef
+)
+
+st.set_page_config(page_title="ChromaDB UI", page_icon="🧪", layout="wide")
+st.title("🧪 ChromaDB UI – Incidents Collection")
+
+# ---- Sidebar ----
+with st.sidebar:
+    st.header("Collection Info")
+    st.write(f"**Path**: `./chromadb`")
+    st.write(f"**Collection**: `incidents`")
+    st.write(f"**Total Docs**: {len(collection.get()['ids'])}")
+
+# ---- Tabs ----
+tab_overview, tab_query, tab_upsert, tab_delete = st.tabs(
+    ["Overview", "Query", "Upsert", "Delete"]
+)
+
+# ---------- OVERVIEW TAB ----------
+with tab_overview:
+    st.subheader("📦 Collection Preview")
+    try:
+        # data = collection.get(limit=10, include=["ids", "documents", "metadatas"])
+        # st.json(data)
+        data = collection.get(limit=10, include=["documents", "metadatas"])
+    
+        # ✅ Explicitly show IDs separately
+        preview = {
+            "ids": data.get("ids", []),
+            "documents": data.get("documents", []),
+            "metadatas": data.get("metadatas", [])
+        }
+        st.json(preview)
+    except Exception as e:
+        st.error(f"Failed to fetch preview: {e}")
+
+# ---------- QUERY TAB ----------
+with tab_query:
+    st.subheader("🔎 Similarity Search")
+    query_text = st.text_area("Enter query text", height=100)
+    top_k = st.slider("Top K", 1, 20, 5)
+    if st.button("Run Query"):
+        try:
+            results = collection.query(
+                query_texts=[query_text],
+                n_results=top_k,
+                include=["documents", "metadatas"]
+            )
+            st.json(results)
+        except Exception as e:
+            st.error(f"Query failed: {e}")
+
+# ---------- UPSERT TAB ----------
+with tab_upsert:
+    st.subheader("➕ Add / Upsert Records")
+    ids = st.text_area("IDs (comma-separated)")
+    docs = st.text_area("Documents (one per line)")
+    metas = st.text_area(
+        "Metadatas JSON list (optional)",
+        help='Example: [{"source":"faq"},{"source":"guide"}]'
+    )
+
+    if st.button("Upsert"):
+        try:
+            id_list = [s.strip() for s in ids.split(",") if s.strip()]
+            doc_list = [s for s in docs.splitlines() if s.strip()]
+            meta_list = None
+            if metas.strip():
+                import json
+                meta_list = json.loads(metas)
+            if len(id_list) != len(doc_list):
+                st.error("IDs and Documents count must match")
+            else:
+                collection.upsert(ids=id_list, documents=doc_list, metadatas=meta_list)
+                st.success(f"Upserted {len(id_list)} record(s)")
+        except Exception as e:
+            st.error(f"Upsert failed: {e}")
+
+# ---------- DELETE TAB ----------
+with tab_delete:
+    st.subheader("🗑️ Delete Records")
+    del_ids = st.text_input("IDs to delete (comma-separated)")
+    if st.button("Delete IDs"):
+        try:
+            id_list = [s.strip() for s in del_ids.split(",") if s.strip()]
+            if id_list:
+                collection.delete(ids=id_list)
+                st.success(f"Deleted {len(id_list)} id(s)")
+            else:
+                st.info("No IDs provided.")
+        except Exception as e:
+            st.error(f"Delete failed: {e}")
