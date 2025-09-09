@@ -1,0 +1,39 @@
+Changes in code
+risk.py
+from collections import Counter
+from services.data_loarder import load_change_task_by_id, load_affected_ci_by_id
+#Add after fetching change details
+	apps = load_application_master()
+    app_change_maturity_res = load_application_change_maturity()
+    group_maturity_res = load_group_maturity()
+    tasks = load_change_task_by_id(change_number)
+    cis = load_affected_ci_by_id(change_number)
+    app_maturity_data = app_change_maturity_res.get(str(change.get("u_clarity_id")))
+    app_maturity = 'Not Found'
+    app_past_mim = 'Not Found'
+    app_past_p0_p1 = 'Not Fpound'
+    if app_maturity_data:
+        app_maturity = app_maturity_data["Maturity"]
+        app_past_mim = app_maturity_data["Past MIM"]
+        app_past_p0_p1 = app_maturity_data["Past P0-P1 INC"]
+    group_maturity_data = group_maturity_res.get(str(change.get("Change Coordinator Group")))
+    group_maturity = 'Not Found'
+    if group_maturity_data:
+        group_maturity = group_maturity_data["Maturity"]
+    priority_count = None
+    if tasks:
+        priority_count = json.dumps(Counter(task["Priority"] for task in tasks))
+    
+#Add in payload
+		"no_of_tasks": len(tasks),
+        "cis": len(cis),
+        "task_count_by_priority": priority_count,
+        "app_maturity": app_maturity,
+        "app_past_mim": app_past_mim,
+        "app_past_p0_p1": app_past_p0_p1,
+        "group_maturity":group_maturity,
+
+
+# Action Item - Add Group maturity of change task groups
+
+
